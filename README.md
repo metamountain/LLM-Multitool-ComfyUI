@@ -24,7 +24,7 @@ local vision model by itself, so no loader node or extra wires are needed.
 
 ```
 cd ComfyUI/custom_nodes
-git clone https://github.com/metamountain/Comfyui-Unsloth-Open-Api- llm_multitool
+git clone https://github.com/metamountain/LLM-Multitool-ComfyUI llm_multitool
 ```
 
 Needs only `numpy`, `Pillow`, `requests` (already in ComfyUI).
