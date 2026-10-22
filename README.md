@@ -1,7 +1,7 @@
 # LLM_Multitool for ComfyUI
 
 One node for vision and text LLMs on any OpenAI-compatible server
-(BeeLlama / llama.cpp, Unsloth Studio, OpenAI). It can also start a small
+(llama.cpp, Ollama, LM Studio, vLLM, Unsloth Studio, OpenAI ...). It can also start a small
 local vision model by itself, so no loader node or extra wires are needed.
 
 > Replaces the earlier *Unsloth API PRO* + *Unsloth Model Picker* nodes.
@@ -17,6 +17,9 @@ local vision model by itself, so no loader node or extra wires are needed.
   its own `llama-server` on port **8081**; switching models restarts it.
   `server (api_url)` uses whatever the server at `api_url` serves.
 - **Active model shown on the node** after each run (read-only `active` field).
+- **`unload local model` button**: stops the port-8081 server and frees its VRAM.
+  There is one such server shared by all LLM_Multitool nodes. It also unloads by
+  itself after 5 min idle and when ComfyUI exits.
 - **Hover help** on every input.
 - Thinking / reasoning output, seed, retries with back-off, `extra_body` JSON overrides.
 
@@ -29,8 +32,31 @@ git clone https://github.com/metamountain/LLM-Multitool-ComfyUI llm_multitool
 
 Needs only `numpy`, `Pillow`, `requests` (already in ComfyUI).
 
-For `local_model` you need a `llama-server` binary (llama.cpp or BeeLlama).
-It is found via the env var `BEELLAMA_BIN`, then `PATH`.
+For `local_model` you need a `llama-server` binary from
+[llama.cpp](https://github.com/ggml-org/llama.cpp/releases) (or a fork) with vision
+support. It is found via `PATH`, or set the env var `LLAMA_SERVER_BIN` to its full
+path, e.g. in your ComfyUI start script:
+
+```
+set LLAMA_SERVER_BIN=C:\llama.cpp\llama-server.exe
+```
+
+Use a recent llama.cpp build: the server is started with `--fit off`,
+`--flash-attn on`, `--image-max-tokens` and `--sleep-idle-seconds`. If it exits
+right away, the node's error message shows the last lines of its log.
+
+Optional environment variables:
+
+| Variable | Default | |
+|---|---|---|
+| `LLAMA_SERVER_BIN` | `llama-server` on PATH | server binary |
+| `LLM_MULTITOOL_PORT` | `8081` | port of the local server |
+| `LLM_MULTITOOL_CTX` | `16384` | context size of the local server |
+| `LLM_MULTITOOL_LOAD_S` | `300` | max seconds to wait for a model to load |
+
+Tested on Windows; Linux and macOS should work but are untested so far.
+A saved workflow that names a `local_model` missing on your machine still loads;
+the node only reports it when it runs.
 
 ## Recommended small vision model (< 4 GB)
 
@@ -55,11 +81,11 @@ for loading. The server unloads the model after 5 min idle.
 | `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`, `presence_penalty` | Sampling |
 | `max_tokens`, `seed`, `timeout_s`, `max_retries` | Output / connection |
 | `enable_thinking`, `reasoning_effort` | Reasoning |
-| `image` (optional) | IMAGE for vision |
+| `image` (optional) | IMAGE for vision (first image of a batch) |
 | `model_id` (optional) | `auto` = ask the server |
-| `backend` (optional) | `beellama` / `unsloth` / `openai` parameter dialect |
+| `backend` (optional) | `llama.cpp` / `unsloth` / `openai` parameter dialect (`beellama` = old name of `llama.cpp`) |
 | `extra_body` (optional) | JSON merged into the request last |
-| `local_model` (optional) | Local GGUF to run on port 8081 |
+| `local_model` (optional) | Local GGUF to run on port 8081 (projector picked by matching name, F16 preferred) |
 | `text` (optional socket) | Text input for text-to-text chains |
 
 ## Outputs

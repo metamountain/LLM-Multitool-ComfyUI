@@ -7,7 +7,7 @@ Modes:
   vision    — Image + text prompt -> text response
   text      — Text only -> text response
 
-local_model: starts its own BeeLlama server (port 8081) for a local GGUF + mmproj.
+local_model: starts its own llama-server (port 8081) for a local GGUF + mmproj.
 
 Defaults tuned for Gemma 4 2B (gemma-4-2b-it / gemma-4-2b-it-GGUF)
 """
@@ -19,7 +19,10 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
+import tempfile
+import threading
 import time
 import requests
 from io import BytesIO
@@ -34,7 +37,7 @@ from PIL import Image
 HELP = {
     # Connection
     "api_url":
-        "Base URL of the BeeLlama / llama.cpp server (OpenAI-compatible).\n"
+        "Base URL of an OpenAI-compatible server (llama.cpp, BeeLlama, ...).\n"
         "Default: http://127.0.0.1:8080\n"
         "Change only if the server runs on a different port or machine.",
 
@@ -131,8 +134,9 @@ HELP = {
 
     "backend":
         "Which server API dialect to speak:\n"
-        "  beellama -- BeeLlama / llama.cpp server (top_k, min_p,\n"
+        "  llama.cpp -- llama-server and forks (top_k, min_p,\n"
         "              repeat_penalty, thinking via chat_template_kwargs)\n"
+        "  beellama  -- old name of llama.cpp, kept for saved workflows\n"
         "  unsloth  -- Unsloth Studio (model from /api/inference/status)\n"
         "  openai   -- plain OpenAI API, only standard fields are sent\n"
         "              (top_k, min_p, repetition_penalty are ignored)",
@@ -146,7 +150,7 @@ HELP = {
     "local_model":
         "Model to run:\n"
         "  server (api_url) -- use whatever the server at api_url serves\n"
-        "  <gguf>           -- start a BeeLlama server on port 8081 with this\n"
+        "  <gguf>           -- start a llama-server on port 8081 with this\n"
         "                      GGUF + its mmproj (vision); api_url is ignored.\n"
         "Lists every GGUF that has an mmproj*.gguf next to it (HF cache and\n"
         "ComfyUI models/LLM). Switching models restarts that server.",
@@ -182,7 +186,8 @@ def _build_headers(api_key: str) -> dict:
     return h
 
 
-BACKENDS = ["beellama", "unsloth", "openai"]
+BACKENDS = ["llama.cpp", "unsloth", "openai", "beellama"]   # beellama = old name
+LLAMA_CPP = ("llama.cpp", "beellama")
 
 
 def _get_active_model(base_url: str, api_key: str, backend: str):
@@ -238,28 +243,37 @@ def _parse_extra_body(text: str):
 
 
 # =============================================================================
-#  LOCAL MODEL LOADER -- own BeeLlama server for a local GGUF + mmproj
+#  LOCAL MODEL LOADER -- own llama-server for a local GGUF + mmproj
 # =============================================================================
 
 SERVER_CHOICE  = "server (api_url)"
-LOCAL_PORT     = 8081
+# Overridable via environment, e.g. in the ComfyUI start script.
+LOCAL_PORT     = int(os.environ.get("LLM_MULTITOOL_PORT", "8081"))
 LOCAL_URL      = f"http://127.0.0.1:{LOCAL_PORT}"
-LOCAL_CTX      = 8192
-LOCAL_LOAD_S   = 180      # max wait for the model to load
-BEELLAMA_BIN   = (os.environ.get("BEELLAMA_BIN") or shutil.which("llama-server")
-                  or r"D:\BeeLlama\bin\llama-server.exe")
-_NODE_DIR      = os.path.dirname(os.path.abspath(__file__))
-_PID_FILE      = os.path.join(_NODE_DIR, "local_server.pid")
-_LOG_FILE      = os.path.join(_NODE_DIR, "local_server.log")
+LOCAL_CTX      = int(os.environ.get("LLM_MULTITOOL_CTX", "16384"))
+LOCAL_LOAD_S   = int(os.environ.get("LLM_MULTITOOL_LOAD_S", "300"))   # max wait for loading
+# llama.cpp (or a fork such as BeeLlama): env LLAMA_SERVER_BIN, old name BEELLAMA_BIN, then PATH
+LLAMA_SERVER_BIN = (os.environ.get("LLAMA_SERVER_BIN") or os.environ.get("BEELLAMA_BIN")
+                    or shutil.which("llama-server") or "")
+_STATE_DIR     = os.path.join(tempfile.gettempdir(), "llm_multitool")
+_PID_FILE      = os.path.join(_STATE_DIR, f"local_server_{LOCAL_PORT}.pid")
+_LOG_FILE      = os.path.join(_STATE_DIR, f"local_server_{LOCAL_PORT}.log")
 _MMPROJ_PREF   = ("f16", "bf16", "f32")
+_SCAN_TTL_S    = 30       # INPUT_TYPES runs on every queue -- don't walk the disk each time
 
 _local_models  = {}       # label -> (model_path, mmproj_path)
+_local_scan_t  = 0.0
 _local_proc    = None     # Popen of the server started by this ComfyUI process
+_local_label   = None     # label that _local_proc serves (or is still loading)
+_local_lock    = threading.RLock()
 
 
 def _model_dirs():
-    hf_home = os.environ.get("HF_HOME") or os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
-    dirs = [os.environ.get("HF_HUB_CACHE") or os.path.join(hf_home, "hub")]
+    hf_home = os.environ.get("HF_HOME") or os.path.join(
+        os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache"),
+        "huggingface")
+    dirs = [os.environ.get("HF_HUB_CACHE") or os.environ.get("HUGGINGFACE_HUB_CACHE")
+            or os.path.join(hf_home, "hub")]
     try:
         import folder_paths
         dirs.append(os.path.join(folder_paths.models_dir, "LLM"))
@@ -268,9 +282,23 @@ def _model_dirs():
     return [d for d in dirs if os.path.isdir(d)]
 
 
+def _pick_mmproj(model_file, mmprojs):
+    """Projector for `model_file`: longest shared name prefix, then F16 > BF16 > F32."""
+    base = model_file.lower()
+
+    def score(f):
+        name = f.lower()[len("mmproj"):].lstrip("-_.")
+        common = len(os.path.commonprefix([base, name]))
+        tok = re.split(r"[-_.]", f.lower()[:-5])[-1]    # exact, "bf16" must not match "f16"
+        pref = _MMPROJ_PREF.index(tok) if tok in _MMPROJ_PREF else 99
+        return (-common, pref)
+
+    return min(mmprojs, key=score)
+
+
 def _scan_local_models():
     """Every GGUF with an mmproj*.gguf in the same folder -> {label: (model, mmproj)}"""
-    found = {}
+    found, mtimes = {}, {}
     for root_dir in _model_dirs():
         for dirpath, dirnames, filenames in os.walk(root_dir):
             dirnames[:] = [d for d in dirnames if d not in ("blobs", ".cache", ".locks")]
@@ -279,20 +307,33 @@ def _scan_local_models():
             mmproj = [f for f in ggufs if f.lower().startswith("mmproj")]
             if not mmproj:
                 continue
-            mmproj.sort(key=lambda f: next((i for i, p in enumerate(_MMPROJ_PREF)
-                                            if f.lower()[:-5].endswith(p)), 99))
             for f in ggufs:
                 part = re.search(r"-(\d{5})-of-\d{5}\.gguf$", f)
                 if f in mmproj or f.lower().startswith("mtp-") or (part and part.group(1) != "00001"):
                     continue    # skip projectors, MTP draft heads, non-first split parts
                 path  = os.path.join(dirpath, f)
                 label = f[:-5]
-                # Same file in several snapshots / folders: keep the newest.
-                if label in found and os.path.getmtime(found[label][0]) >= os.path.getmtime(path):
+                try:
+                    mtime, size = os.path.getmtime(path), os.path.getsize(path)
+                except OSError:
                     continue
-                found[label] = (path, os.path.join(dirpath, mmproj[0]))
-    sizes = {k: os.path.getsize(v[0]) for k, v in found.items()}
-    return dict(sorted(found.items(), key=lambda kv: sizes[kv[0]]))
+                # Same file in several snapshots / folders: keep the newest.
+                if label in found and mtimes[label][0] >= mtime:
+                    continue
+                found[label] = (path, os.path.join(dirpath, _pick_mmproj(f, mmproj)))
+                mtimes[label] = (mtime, size)
+    return dict(sorted(found.items(), key=lambda kv: mtimes[kv[0]][1]))
+
+
+def _local_models_cached(force=False):
+    global _local_models, _local_scan_t
+    if force or time.time() - _local_scan_t > _SCAN_TTL_S:
+        try:
+            _local_models = _scan_local_models()
+        except Exception as exc:    # never break node registration over a scan
+            print(f"[LLM_Multitool] model scan failed: {exc}")
+        _local_scan_t = time.time()
+    return _local_models
 
 
 def _local_alias(label: str) -> str:
@@ -300,9 +341,11 @@ def _local_alias(label: str) -> str:
 
 
 def _local_served():
-    """Alias served on LOCAL_PORT, or None if nothing answers."""
+    """Alias served on LOCAL_PORT, None if nothing answers, "" while it is still loading."""
     try:
         r = requests.get(f"{LOCAL_URL}/v1/models", timeout=3)
+        if r.status_code == 503:
+            return ""
         r.raise_for_status()
         models = r.json().get("data") or []
         return models[0].get("id") if models else ""
@@ -310,58 +353,128 @@ def _local_served():
         return None
 
 
+def _is_llama_server(pid: int) -> bool:
+    """True if `pid` is still our server binary (PIDs get reused)."""
+    names = {b"llama-server"}
+    if LLAMA_SERVER_BIN:
+        names.add(os.path.splitext(os.path.basename(LLAMA_SERVER_BIN))[0].lower().encode())
+    if os.name == "nt":
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                             capture_output=True).stdout
+    else:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "comm="], capture_output=True).stdout
+    return any(n in out.lower() for n in names)
+
+
+def _log_tail(n=8) -> str:
+    try:
+        with open(_LOG_FILE, encoding="utf-8", errors="replace") as f:
+            return "".join(f.readlines()[-n:]).strip()
+    except OSError:
+        return ""
+
+
 def _stop_local_server():
-    global _local_proc
-    if _local_proc is not None and _local_proc.poll() is None:
-        _local_proc.terminate()
-        try:
-            _local_proc.wait(10)
-        except subprocess.TimeoutExpired:
-            _local_proc.kill()
-    _local_proc = None
-    # Server left over from an earlier ComfyUI run: only kill it if it is ours.
-    if os.path.exists(_PID_FILE):
-        try:
-            pid = int(open(_PID_FILE).read().strip())
-            out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                                 capture_output=True).stdout
-            if b"llama-server" in out.lower():
-                subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
-        except (ValueError, OSError):
-            pass
-        try:
-            os.remove(_PID_FILE)
-        except OSError:
-            pass
-    for _ in range(20):    # wait until the port is free
-        if _local_served() is None:
-            return
-        time.sleep(0.5)
+    global _local_proc, _local_label
+    with _local_lock:
+        if _local_proc is not None and _local_proc.poll() is None:
+            _local_proc.terminate()
+            try:
+                _local_proc.wait(10)
+            except subprocess.TimeoutExpired:
+                _local_proc.kill()
+        _local_proc, _local_label = None, None
+        # Server left over from an earlier ComfyUI run: only kill it if it is ours.
+        if os.path.exists(_PID_FILE):
+            try:
+                pid = int(open(_PID_FILE).read().strip())
+                if _is_llama_server(pid):
+                    os.kill(pid, signal.SIGTERM)    # Windows: TerminateProcess
+            except (ValueError, OSError):
+                pass
+            try:
+                os.remove(_PID_FILE)
+            except OSError:
+                pass
+        for _ in range(20):    # wait until the port is free
+            if _local_served() is None:
+                return
+            time.sleep(0.5)
 
 
 atexit.register(_stop_local_server)
 
 
+# "unload" button on the node (web/llm_multitool.js) -> stop the local server, free VRAM.
+try:
+    import asyncio
+    from aiohttp import web
+    from server import PromptServer
+
+    @PromptServer.instance.routes.post("/llm_multitool/unload")
+    async def _unload_route(request):
+        was_running = _local_served() is not None
+        await asyncio.get_running_loop().run_in_executor(None, _stop_local_server)
+        return web.json_response({"unloaded": was_running})
+except Exception:    # outside ComfyUI (tests) there is no PromptServer
+    pass
+
+
+def _wait_ready(proc, alias: str):
+    """Wait (without holding the lock) for the server we started -> (base_url, model_id, error)"""
+    deadline = time.time() + LOCAL_LOAD_S
+    while time.time() < deadline:
+        if _local_proc is not proc:
+            return None, None, "local server was unloaded or replaced while loading."
+        if proc.poll() is not None:
+            return None, None, (f"local server exited (code {proc.returncode}) -- "
+                                f"log {_LOG_FILE}:\n{_log_tail()}")
+        try:
+            if requests.get(f"{LOCAL_URL}/health", timeout=2).status_code == 200:
+                return LOCAL_URL, alias, None
+        except requests.exceptions.RequestException:
+            pass
+        time.sleep(0.5)
+    return None, None, (f"local server still loading after {LOCAL_LOAD_S} s -- run again to keep "
+                        f"waiting, or raise env LLM_MULTITOOL_LOAD_S. Log: {_LOG_FILE}")
+
+
 def _ensure_local_server(label: str):
-    """Start (or reuse) the BeeLlama server for `label` -> (base_url, model_id, error_or_None)"""
-    global _local_proc
-    paths = _local_models.get(label) or _scan_local_models().get(label)
-    if not paths:
-        return None, None, f"local model '{label}' not found -- refresh ComfyUI (R)."
-    alias = _local_alias(label)
+    """Start (or reuse) the llama-server for `label` -> (base_url, model_id, error_or_None)"""
+    with _local_lock:
+        paths = _local_models_cached().get(label) or _local_models_cached(force=True).get(label)
+        if not paths:
+            return None, None, f"local model '{label}' not found on this machine -- refresh ComfyUI (R)."
+        alias = _local_alias(label)
+        # Ours and still loading (e.g. after a timeout): keep waiting instead of restarting it.
+        if _local_label == label and _local_proc is not None and _local_proc.poll() is None:
+            proc = _local_proc
+            if _local_served() == alias:
+                return LOCAL_URL, alias, None
+        else:
+            proc = _start_local_server(label, paths, alias)
+            if isinstance(proc, tuple):    # finished: ready or error
+                return proc
+    return _wait_ready(proc, alias)
+
+
+def _start_local_server(label, paths, alias):
+    """Caller holds _local_lock. -> Popen to wait for, or a final result tuple"""
+    global _local_proc, _local_label
     served = _local_served()
     if served == alias:
         return LOCAL_URL, alias, None
     if served is not None and _local_proc is None and not os.path.exists(_PID_FILE):
-        return None, None, (f"Port {LOCAL_PORT} is used by another server ('{served}') "
-                            "-- stop it or pick 'server (api_url)'.")
-    if not os.path.exists(BEELLAMA_BIN):
-        return None, None, f"llama-server not found: {BEELLAMA_BIN} (set env BEELLAMA_BIN)"
+        return None, None, (f"Port {LOCAL_PORT} is used by another server ('{served}') -- "
+                            "stop it, set env LLM_MULTITOOL_PORT, or pick 'server (api_url)'.")
+    if not LLAMA_SERVER_BIN or not os.path.exists(LLAMA_SERVER_BIN):
+        return None, None, ("llama-server not found -- put it on PATH or set env "
+                            "LLAMA_SERVER_BIN to its full path.")
 
     _stop_local_server()
     model_path, mmproj_path = paths
     cmd = [
-        BEELLAMA_BIN,
+        LLAMA_SERVER_BIN,
         "--model", model_path, "--mmproj", mmproj_path,
         "--alias", alias,
         "--host", "127.0.0.1", "--port", str(LOCAL_PORT),
@@ -371,25 +484,16 @@ def _ensure_local_server(label: str):
         "--sleep-idle-seconds", "300",   # unload after 5 min idle, frees VRAM
     ]
     print(f"[LLM_Multitool] Starting local server: {label} on port {LOCAL_PORT}")
-    log = open(_LOG_FILE, "w", encoding="utf-8", errors="replace")
-    _local_proc = subprocess.Popen(
-        cmd, stdout=log, stderr=subprocess.STDOUT,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+    os.makedirs(_STATE_DIR, exist_ok=True)
+    with open(_LOG_FILE, "w", encoding="utf-8", errors="replace") as log:
+        _local_proc = subprocess.Popen(
+            cmd, stdout=log, stderr=subprocess.STDOUT,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    _local_label = label
     with open(_PID_FILE, "w") as f:
         f.write(str(_local_proc.pid))
-
-    deadline = time.time() + LOCAL_LOAD_S
-    while time.time() < deadline:
-        if _local_proc.poll() is not None:
-            return None, None, f"local server exited (code {_local_proc.returncode}) -- see {_LOG_FILE}"
-        try:
-            if requests.get(f"{LOCAL_URL}/health", timeout=2).status_code == 200:
-                return LOCAL_URL, alias, None
-        except requests.exceptions.RequestException:
-            pass
-        time.sleep(0.5)
-    return None, None, f"local server did not get ready in {LOCAL_LOAD_S} s -- see {_LOG_FILE}"
+    return _local_proc
 
 
 # =============================================================================
@@ -398,7 +502,7 @@ def _ensure_local_server(label: str):
 
 class UnslothProAPI:
     """
-    BeeLlama (llama.cpp) inference node -- Vision / Text.
+    OpenAI-compatible LLM node (llama.cpp, Unsloth, OpenAI) -- Vision / Text.
 
     Outputs
     -------
@@ -410,8 +514,7 @@ class UnslothProAPI:
 
     @classmethod
     def INPUT_TYPES(cls):
-        global _local_models
-        local = _local_models = _scan_local_models()
+        local = _local_models_cached()
         return {
             "required": {
 
@@ -529,7 +632,7 @@ class UnslothProAPI:
                 }),
                 # Kept optional and last so saved workflows keep their widget order.
                 "backend": (BACKENDS, {
-                    "default": "beellama",
+                    "default": "llama.cpp",
                     "tooltip": HELP["backend"],
                 }),
                 "extra_body": ("STRING", {
@@ -561,12 +664,20 @@ class UnslothProAPI:
     FUNCTION = "chat"
     CATEGORY = "LLM"
 
+    @classmethod
+    def VALIDATE_INPUTS(cls, local_model=SERVER_CHOICE):
+        # Taking local_model here skips ComfyUI's "value not in list" check for it:
+        # a workflow from another machine must not fail just because that GGUF is
+        # missing here -- _chat() reports it only if this node actually runs.
+        return True
+
     # -- Image / Tensor helpers ------------------------------------------------
 
     @staticmethod
     def _tensor_to_b64_jpeg(image_tensor) -> str:
+        # Only the first image of a batch is sent.
         arr = np.clip(255.0 * image_tensor[0].cpu().numpy(), 0, 255).astype(np.uint8)
-        img = Image.fromarray(arr)
+        img = Image.fromarray(arr).convert("RGB")    # RGBA / grayscale -> JPEG-safe
         buf = BytesIO()
         img.save(buf, format="JPEG", quality=92)
         return base64.b64encode(buf.getvalue()).decode("utf-8")
@@ -587,7 +698,7 @@ class UnslothProAPI:
         max_tokens, seed, timeout_s, max_retries,
         enable_thinking, reasoning_effort,
         image=None, model_id="auto",
-        backend="beellama", extra_body="",
+        backend="llama.cpp", extra_body="",
         local_model=SERVER_CHOICE, text=None,
     ):
         base_url   = api_url.rstrip("/")
@@ -611,7 +722,7 @@ class UnslothProAPI:
             base_url, model_id, err = _ensure_local_server(local_model)
             if err:
                 return (f"ERROR: {err}", "", "none", mode)
-            backend, api_key = "beellama", ""
+            backend, api_key = "llama.cpp", ""
         elif not model_id or model_id.strip().lower() in ("auto", ""):
             resolved, model_extra, err = _get_active_model(base_url, api_key, backend)
             if err:
@@ -655,7 +766,7 @@ class UnslothProAPI:
         }
 
         # Backend-specific parameter names
-        if backend == "beellama":
+        if backend in LLAMA_CPP:
             payload["top_k"]          = top_k
             payload["min_p"]          = min_p
             payload["repeat_penalty"] = repetition_penalty
@@ -707,6 +818,11 @@ class UnslothProAPI:
 
             except requests.exceptions.HTTPError:
                 code   = r.status_code
+                if code == 503 and attempt < max_retries:    # model still (re)loading
+                    wait = 2 ** (attempt + 1)
+                    print(f"[LLM_Multitool] Server loading, retry {attempt+1}/{max_retries} in {wait}s ...")
+                    time.sleep(wait)
+                    continue
                 detail = {
                     401: "401 Unauthorized -- check your API key.",
                     400: f"400 Bad request -- {r.text[:400]}",
