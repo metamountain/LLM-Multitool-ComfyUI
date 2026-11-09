@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <title>LLM_Multitool</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1d2433"/>
+      <stop offset="1" stop-color="#111520"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#3ddc97"/>
+      <stop offset="1" stop-color="#4cc9f0"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="url(#bg)"/>
+  <!-- input wires (image + text) -->
+  <path d="M40 92 C 72 92, 72 118, 96 118" fill="none" stroke="#f7b267" stroke-width="7" stroke-linecap="round"/>
+  <path d="M40 150 C 72 150, 72 130, 96 130" fill="none" stroke="#9d8df1" stroke-width="7" stroke-linecap="round"/>
+  <circle cx="40" cy="92" r="10" fill="#f7b267"/>
+  <circle cx="40" cy="150" r="10" fill="#9d8df1"/>
+  <!-- speech bubble = the LLM -->
+  <path d="M100 76 h96 a22 22 0 0 1 22 22 v52 a22 22 0 0 1 -22 22 h-44 l-26 24 v-24 h-26 a22 22 0 0 1 -22 -22 v-52 a22 22 0 0 1 22 -22 z"
+        fill="none" stroke="url(#accent)" stroke-width="9" stroke-linejoin="round"/>
+  <!-- eye = vision -->
+  <path d="M118 124 Q 148 98 178 124 Q 148 150 118 124 z" fill="none" stroke="#e8ecf4" stroke-width="7" stroke-linejoin="round"/>
+  <circle cx="148" cy="124" r="9" fill="#e8ecf4"/>
+</svg>

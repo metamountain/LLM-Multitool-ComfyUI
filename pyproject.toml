@@ -1,0 +1,13 @@
+[project]
+name = "llm-multitool"
+description = "One ComfyUI node for vision and text LLMs: starts a local llama-server from a GGUF dropdown, or talks to llama.cpp, Ollama and OpenAI-compatible servers. Unload button for VRAM."
+version = "1.0.0"
+dependencies = ["numpy", "Pillow", "requests"]
+
+[project.urls]
+Repository = "https://github.com/metamountain/LLM-Multitool-ComfyUI"
+
+[tool.comfy]
+PublisherId = "metamountain"
+DisplayName = "LLM_Multitool"
+Icon = "https://raw.githubusercontent.com/metamountain/LLM-Multitool-ComfyUI/main/docs/logo.svg"

@@ -1,15 +1,13 @@
 """
 LLM_Multitool - ComfyUI Custom Node
-Node: UnslothProAPI
+Node id: LLM_Multitool
 
 Modes:
   auto      — vision if an image is connected, otherwise text
   vision    — Image + text prompt -> text response
   text      — Text only -> text response
 
-local_model: starts its own llama-server (port 8081) for a local GGUF + mmproj.
-
-Defaults tuned for Gemma 4 2B (gemma-4-2b-it / gemma-4-2b-it-GGUF)
+local_model: starts its own llama-server (port 8081) for a local GGUF (+ mmproj for vision).
 """
 
 import numpy as np
@@ -37,13 +35,23 @@ from PIL import Image
 HELP = {
     # Connection
     "api_url":
-        "Base URL of an OpenAI-compatible server (llama.cpp, BeeLlama, ...).\n"
-        "Default: http://127.0.0.1:8080\n"
-        "Change only if the server runs on a different port or machine.",
+        "Base URL of the server (llama.cpp, Ollama, LM Studio, vLLM, OpenAI ...).\n"
+        "Default: http://127.0.0.1:8080 (Ollama: http://127.0.0.1:11434).\n"
+        "Ignored when local_model is set.",
 
-    "api_key":
-        "API key (server started with --api-key).\n"
-        "Leave blank if the server runs without a key.",
+    "api_key_env":
+        "Name of the environment variable that holds the API key\n"
+        "(e.g. OPENAI_API_KEY, GEMINI_API_KEY).\n"
+        "The key is read via os.environ.get() at run time -- it is NEVER\n"
+        "stored in the workflow file.\n"
+        "Leave empty if the server needs no key (local servers).",
+
+    "unload_after":
+        "Unload the model after the request finishes.\n"
+        "  llama.cpp / router -- POST /models/unload (frees VRAM)\n"
+        "  ollama             -- keep_alive 0 in the request\n"
+        "  openai / unsloth   -- no effect (cloud / managed)\n"
+        "Recommended: True when sharing the GPU with ComfyUI rendering.",
 
     # Mode
     "mode":
@@ -65,23 +73,23 @@ HELP = {
     "temperature":
         "Controls output randomness.\n"
         "0.0 = fully deterministic\n"
-        "1.0 = Gemma 4 recommended default\n"
+        "1.0 = typical default\n"
         "2.0 = very random / creative",
 
     "top_p":
         "Nucleus sampling threshold.\n"
         "Only tokens with cumulative prob <= top_p are sampled.\n"
-        "Gemma 4 recommended: 0.95",
+        "Typical: 0.95",
 
     "top_k":
         "Limit sampling to top-k most likely tokens.\n"
-        "Gemma 4 recommended: 64\n"
+        "Typical: 20-64\n"
         "-1 = disabled (no limit)",
 
     "min_p":
         "Minimum probability filter.\n"
         "Excludes tokens below min_p x prob(top token).\n"
-        "0.0 = disabled (Gemma 4 default)",
+        "0.0 = disabled (default)",
 
     "repetition_penalty":
         "Penalise tokens that already appeared in the output.\n"
@@ -97,12 +105,18 @@ HELP = {
 
     # Output controls
     "max_tokens":
-        "Maximum tokens in the model reply.\n"
-        "Gemma 4 2B context window: 8 192 tokens.",
+        "Maximum tokens in the model reply (thinking counts too).\n"
+        "Empty response? Raise this or turn enable_thinking off.",
+
+    "on_error":
+        "What happens on an error (server down, bad key, empty reply ...):\n"
+        "  stop        -- stop the queue with a red error message (safe)\n"
+        "  return text -- continue; 'response' holds a line starting with ERROR:\n"
+        "                 (careful: that text could end up as your image prompt)",
 
     "seed":
         "Random seed for reproducibility.\n"
-        "-1 = random (server picks a seed each run)\n"
+        "-1 = random: the node runs again on every queue (never cached)\n"
         "Positive integer = fixed seed -> identical output for same input.",
 
     "timeout_s":
@@ -136,10 +150,11 @@ HELP = {
         "Which server API dialect to speak:\n"
         "  llama.cpp -- llama-server and forks (top_k, min_p,\n"
         "              repeat_penalty, thinking via chat_template_kwargs)\n"
-        "  beellama  -- old name of llama.cpp, kept for saved workflows\n"
         "  unsloth  -- Unsloth Studio (model from /api/inference/status)\n"
         "  openai   -- plain OpenAI API, only standard fields are sent\n"
-        "              (top_k, min_p, repetition_penalty are ignored)",
+        "              (top_k, min_p, repetition_penalty are ignored)\n"
+        "  ollama   -- Ollama native API (/api/chat, images as base64 array,\n"
+        "              keep_alive for VRAM management)",
 
     "extra_body":
         "Optional JSON object merged into the request last,\n"
@@ -151,9 +166,26 @@ HELP = {
         "Model to run:\n"
         "  server (api_url) -- use whatever the server at api_url serves\n"
         "  <gguf>           -- start a llama-server on port 8081 with this\n"
-        "                      GGUF + its mmproj (vision); api_url is ignored.\n"
-        "Lists every GGUF that has an mmproj*.gguf next to it (HF cache and\n"
-        "ComfyUI models/LLM). Switching models restarts that server.",
+        "                      GGUF (+ its mmproj for vision); api_url is ignored.\n"
+        "  <gguf> (text)    -- no mmproj next to it: text only, no images.\n"
+        "Scans the HF cache and ComfyUI models/LLM, text_encoders, clip\n"
+        "(and extra_model_paths.yaml) for GGUF files. Switching restarts the server.",
+
+    "keep_alive":
+        "Ollama only: seconds the model stays loaded after the reply.\n"
+        "0 = unload right away (frees VRAM for rendering).",
+
+    "clean_output":
+        "Clean the reply: remove think blocks, Markdown and surrounding quotes.\n"
+        "Useful when the reply goes straight into a render prompt.",
+
+    "image_mode":
+        "first -- send only the first image of a batch\n"
+        "all   -- send every image of the batch (up to 8) in one request",
+
+    "image":
+        "Optional image. With mode 'auto' the node switches to vision\n"
+        "when an image is connected.",
 
     "text":
         "Optional text input (e.g. from another LLM or a prompt node).\n"
@@ -163,21 +195,107 @@ HELP = {
 
 
 # =============================================================================
-#  GEMMA 4 2B RECOMMENDED SAMPLING DEFAULTS
+#  SAMPLING DEFAULTS
 # =============================================================================
 
-_GEMMA4_TEMP       = 1.0
-_GEMMA4_TOP_P      = 0.95
-_GEMMA4_TOP_K      = 64
-_GEMMA4_MIN_P      = 0.0
-_GEMMA4_REP_PEN    = 1.1
-_GEMMA4_PRES_PEN   = 0.0
-_GEMMA4_MAX_TOKENS = 2048
+_DEFAULT_TEMP       = 1.0
+_DEFAULT_TOP_P      = 0.95
+_DEFAULT_TOP_K      = 64
+_DEFAULT_MIN_P      = 0.0
+_DEFAULT_REP_PEN    = 1.1
+_DEFAULT_PRES_PEN   = 0.0
+_DEFAULT_MAX_TOKENS = 2048
 
 
 # =============================================================================
 #  SHARED HELPERS
 # =============================================================================
+
+def _clean_response(text: str, max_words: int = 0) -> str:
+    """Remove think blocks, Markdown, surrounding quotes. Optional word limit.
+    """
+    if not text:
+        return text
+    # Remove think/reasoning blocks (also a leftover block whose opening tag is missing)
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S | re.I)
+    if re.search(r"</think>", text, flags=re.I):
+        text = re.split(r"</think>", text, flags=re.I)[-1]
+    # Remove Markdown formatting
+    text = re.sub(r"[*_#`>]", "", text)
+    # Remove surrounding quotes
+    text = text.strip().strip('"').strip("'").strip()
+    # Collapse whitespace
+    text = re.sub(r"\s+", " ", text)
+    # Word limit
+    if max_words > 0:
+        words = text.split()
+        if len(words) > max_words:
+            text = " ".join(words[:max_words])
+    return text
+
+
+def _validate_api_key_env(name: str) -> str | None:
+    """Return an error string if *name* is not a valid env-var name, else None.
+
+    Rules:
+    - must match ^[A-Za-z_][A-Za-z0-9_]*$
+    - must NOT look like an actual key (sk-, AIza, > 64 chars)
+    """
+    if not name or not name.strip():
+        return None  # empty = no key
+    n = name.strip()
+    # Key check first, and never echo the value: it may be a real key.
+    if re.match(r"^(sk-|sk_|AIza|ghp_|hf_|xai-|gsk_)", n) or len(n) > 64:
+        return ("api_key_env looks like an API key value, not a variable name. "
+                "Put the key in an environment variable and enter only its NAME "
+                "(e.g. OPENAI_API_KEY), not the key itself.")
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", n):
+        return ("api_key_env is not a valid variable name. "
+                "It must match [A-Za-z_][A-Za-z0-9_]* (letters, digits, underscores).")
+    return None
+
+
+def _resolve_api_key(api_key_env: str) -> tuple[str, str | None]:
+    """API key from the environment variable named in api_key_env -> (key, error_or_None)."""
+    err = _validate_api_key_env(api_key_env)
+    if err:
+        return "", err
+    if api_key_env and api_key_env.strip():
+        key = os.environ.get(api_key_env.strip(), "")
+        if not key:
+            return "", (f"Environment variable '{api_key_env.strip()}' is not set. "
+                        f"Set it in your ComfyUI start script before launching.")
+        return key, None
+    return "", None
+
+
+def _normalize_url(url: str) -> str:
+    """Forgive common api_url mistakes: missing http://, trailing slash or /v1."""
+    u = (url or "").strip() or "http://127.0.0.1:8080"
+    if not re.match(r"^https?://", u, flags=re.I):
+        u = "http://" + u
+    u = u.rstrip("/")
+    if u.lower().endswith("/v1"):
+        u = u[:-3].rstrip("/")
+    return u
+
+
+def _pick_router_model(models: list):
+    """First model a llama.cpp router has in VRAM ('loaded' / 'sleeping').
+
+    Plain llama-server entries have no 'status' -> first entry.
+    Returns None if this is a router with no model loaded (asking for an
+    unloaded one would make the router load it).
+    """
+    if not models:
+        return None
+    if not any(isinstance(m.get("status"), dict) for m in models):
+        return models[0].get("id")
+    for m in models:
+        if (m.get("status") or {}).get("value") in ("loaded", "sleeping", "loading"):
+            return m.get("id")
+    return None
+
 
 def _build_headers(api_key: str) -> dict:
     h = {"Content-Type": "application/json"}
@@ -186,17 +304,22 @@ def _build_headers(api_key: str) -> dict:
     return h
 
 
-BACKENDS = ["llama.cpp", "unsloth", "openai", "beellama"]   # beellama = old name
-LLAMA_CPP = ("llama.cpp", "beellama")
+BACKENDS = ["llama.cpp", "ollama", "openai", "unsloth"]
 
 
 def _get_active_model(base_url: str, api_key: str, backend: str):
     """Ask the server which model it serves -> (model_id, extra_payload, error_or_None)
 
     unsloth  : GET /api/inference/status (also yields gguf_variant)
+    ollama   : GET /api/tags (first model)
     otherwise: GET /v1/models, first entry
     """
-    endpoint = "/api/inference/status" if backend == "unsloth" else "/v1/models"
+    if backend == "ollama":
+        endpoint = "/api/tags"
+    elif backend == "unsloth":
+        endpoint = "/api/inference/status"
+    else:
+        endpoint = "/v1/models"
     try:
         r = requests.get(
             f"{base_url}{endpoint}",
@@ -205,6 +328,18 @@ def _get_active_model(base_url: str, api_key: str, backend: str):
         )
         r.raise_for_status()
         data = r.json()
+        if backend == "ollama":
+            models = data.get("models") or []
+            if not models:
+                return None, {}, "Ollama lists no model -- pull one first (ollama pull <name>)."
+            try:   # prefer a model that is already in VRAM
+                ps = requests.get(f"{base_url}/api/ps", headers=_build_headers(api_key),
+                                  timeout=15).json().get("models") or []
+                if ps:
+                    return ps[0].get("name") or "unknown", {}, None
+            except Exception:
+                pass
+            return models[0].get("name") or "unknown", {}, None
         if backend == "unsloth":
             if not data.get("loaded", True):
                 return None, {}, "No model loaded in Unsloth Studio -- load one first."
@@ -215,7 +350,11 @@ def _get_active_model(base_url: str, api_key: str, backend: str):
         models = data.get("data") or []
         if not models:
             return None, {}, "Server lists no model -- is it started with a model?"
-        return models[0].get("id") or "unknown", {}, None
+        picked = _pick_router_model(models)    # router: the loaded model, else the first
+        if not picked:
+            return None, {}, ("Router has no model loaded -- load one, or enter its id "
+                              "in model_id (the router then loads it).")
+        return picked, {}, None
     except requests.exceptions.ConnectionError:
         return None, {}, f"Cannot reach {base_url} -- is the {backend} server running?"
     except requests.exceptions.HTTPError as exc:
@@ -224,6 +363,10 @@ def _get_active_model(base_url: str, api_key: str, backend: str):
             return None, {}, "401 Unauthorized -- check your API key."
         if code == 503:
             return None, {}, "503 -- server is still loading the model, try again."
+        if code == 404:
+            return None, {}, (f"{base_url} has no {endpoint} -- wrong 'backend'? "
+                              f"('{backend}' selected; llama.cpp / LM Studio / vLLM = llama.cpp or "
+                              f"openai, Ollama = ollama, Unsloth Studio = unsloth)")
         return None, {}, f"HTTP {code} from {endpoint}"
     except Exception as exc:
         return None, {}, f"Model query failed: {exc}"
@@ -274,12 +417,28 @@ def _model_dirs():
         "huggingface")
     dirs = [os.environ.get("HF_HUB_CACHE") or os.environ.get("HUGGINGFACE_HUB_CACHE")
             or os.path.join(hf_home, "hub")]
-    try:
+    try:    # ComfyUI folders, including extra_model_paths.yaml
         import folder_paths
         dirs.append(os.path.join(folder_paths.models_dir, "LLM"))
+        for kind in ("LLM", "text_encoders", "clip"):
+            try:
+                dirs += folder_paths.get_folder_paths(kind)
+            except Exception:
+                pass
     except ImportError:
         pass
-    return [d for d in dirs if os.path.isdir(d)]
+    seen, out = set(), []
+    for d in dirs:
+        key = os.path.normcase(os.path.abspath(d)) if d else ""
+        if d and key not in seen and os.path.isdir(d):
+            seen.add(key)
+            out.append(d)
+    return out
+
+
+# GGUFs that cannot chat on their own: draft / MTP heads (speculative decoding),
+# encoder-only text encoders (T5 ...).
+_NOT_CHAT = re.compile(r"^mtp-|dflash|draft|encoder", re.I)
 
 
 def _pick_mmproj(model_file, mmprojs):
@@ -297,7 +456,11 @@ def _pick_mmproj(model_file, mmprojs):
 
 
 def _scan_local_models():
-    """Every GGUF with an mmproj*.gguf in the same folder -> {label: (model, mmproj)}"""
+    """Every GGUF -> {label: (model, mmproj or None)}.
+
+    With an mmproj*.gguf in the same folder it can see images; without one it is
+    listed as "<name> (text)" and runs text only.
+    """
     found, mtimes = {}, {}
     for root_dir in _model_dirs():
         for dirpath, dirnames, filenames in os.walk(root_dir):
@@ -305,14 +468,12 @@ def _scan_local_models():
             ggufs  = [f for f in filenames if f.lower().endswith(".gguf")
                       and os.path.exists(os.path.join(dirpath, f))]   # skip dangling links
             mmproj = [f for f in ggufs if f.lower().startswith("mmproj")]
-            if not mmproj:
-                continue
             for f in ggufs:
                 part = re.search(r"-(\d{5})-of-\d{5}\.gguf$", f)
-                if f in mmproj or f.lower().startswith("mtp-") or (part and part.group(1) != "00001"):
-                    continue    # skip projectors, MTP draft heads, non-first split parts
+                if (f in mmproj or _NOT_CHAT.search(f) or (part and part.group(1) != "00001")):
+                    continue    # skip projectors, draft heads, encoders, non-first split parts
                 path  = os.path.join(dirpath, f)
-                label = f[:-5]
+                label = f[:-5] if mmproj else f"{f[:-5]} (text)"
                 try:
                     mtime, size = os.path.getmtime(path), os.path.getsize(path)
                 except OSError:
@@ -320,7 +481,8 @@ def _scan_local_models():
                 # Same file in several snapshots / folders: keep the newest.
                 if label in found and mtimes[label][0] >= mtime:
                     continue
-                found[label] = (path, os.path.join(dirpath, _pick_mmproj(f, mmproj)))
+                found[label] = (path, os.path.join(dirpath, _pick_mmproj(f, mmproj))
+                                if mmproj else None)
                 mtimes[label] = (mtime, size)
     return dict(sorted(found.items(), key=lambda kv: mtimes[kv[0]][1]))
 
@@ -337,6 +499,7 @@ def _local_models_cached(force=False):
 
 
 def _local_alias(label: str) -> str:
+    label = label.removesuffix(" (text)")
     return "local-" + "".join(c if c.isalnum() or c in "._-" else "_" for c in label)
 
 
@@ -405,7 +568,63 @@ def _stop_local_server():
 atexit.register(_stop_local_server)
 
 
-# "unload" button on the node (web/llm_multitool.js) -> stop the local server, free VRAM.
+def _unload_remote(api_url: str, backend: str, api_key: str = ""):
+    """Free the VRAM of the server at api_url -> (unloaded_names, note).
+
+    llama.cpp router : POST /models/unload for every loaded / sleeping / loading model
+    plain llama-server: no unload API -> note only
+    ollama           : keep_alive 0 for every model in /api/ps
+    openai / unsloth : nothing to unload
+    """
+    base, h, done = _normalize_url(api_url), _build_headers(api_key), []
+    try:
+        if backend == "ollama":
+            for m in requests.get(f"{base}/api/ps", headers=h, timeout=10).json().get("models") or []:
+                name = m.get("name") or m.get("model")
+                requests.post(f"{base}/api/generate", json={"model": name, "keep_alive": 0},
+                              headers=h, timeout=30)
+                done.append(name)
+            return done, "" if done else "Ollama has no model loaded."
+        if backend == "llama.cpp":
+            models = requests.get(f"{base}/v1/models", headers=h, timeout=10).json().get("data") or []
+            if not any(isinstance(m.get("status"), dict) for m in models):
+                return [], "plain llama-server has no unload API -- stop that server yourself."
+            for m in models:
+                if (m.get("status") or {}).get("value") in ("loaded", "sleeping", "loading"):
+                    r = requests.post(f"{base}/models/unload", json={"model": m["id"]},
+                                      headers=h, timeout=30)
+                    if r.ok:
+                        done.append(m["id"])
+            return done, "" if done else "router has no model loaded."
+        return [], f"{backend}: nothing to unload (cloud / managed server)."
+    except requests.exceptions.ConnectionError:
+        return done, f"cannot reach {base}."
+    except Exception as exc:
+        return done, f"unload failed: {exc}"
+
+
+def _unload_all(api_url="", backend="llama.cpp", api_key_env=""):
+    """'unload model' button: own local server + model at api_url -> (any_unloaded, message)."""
+    parts, any_done = [], False
+    if _local_served() is not None:
+        _stop_local_server()
+        parts.append(f"local server (port {LOCAL_PORT}) stopped")
+        any_done = True
+    if api_url:
+        key, err = _resolve_api_key(api_key_env)
+        if err:
+            parts.append(err)
+        else:
+            names, note = _unload_remote(api_url, backend, key)
+            if names:
+                parts.append("unloaded " + ", ".join(names))
+                any_done = True
+            elif note and not any_done:
+                parts.append(note)
+    return any_done, "; ".join(parts) or "nothing loaded."
+
+
+# "unload model" button on the node (web/llm_multitool.js) -> free VRAM.
 try:
     import asyncio
     from aiohttp import web
@@ -413,9 +632,15 @@ try:
 
     @PromptServer.instance.routes.post("/llm_multitool/unload")
     async def _unload_route(request):
-        was_running = _local_served() is not None
-        await asyncio.get_running_loop().run_in_executor(None, _stop_local_server)
-        return web.json_response({"unloaded": was_running})
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        args = {k: str(body.get(k) or "") for k in ("api_url", "backend", "api_key_env")}
+        args["backend"] = args["backend"] or "llama.cpp"
+        done, msg = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: _unload_all(**args))
+        return web.json_response({"unloaded": done, "message": msg})
 except Exception:    # outside ComfyUI (tests) there is no PromptServer
     pass
 
@@ -475,7 +700,8 @@ def _start_local_server(label, paths, alias):
     model_path, mmproj_path = paths
     cmd = [
         LLAMA_SERVER_BIN,
-        "--model", model_path, "--mmproj", mmproj_path,
+        "--model", model_path,
+        *(["--mmproj", mmproj_path] if mmproj_path else []),
         "--alias", alias,
         "--host", "127.0.0.1", "--port", str(LOCAL_PORT),
         "--ctx-size", str(LOCAL_CTX), "--parallel", "1",
@@ -500,9 +726,9 @@ def _start_local_server(label, paths, alias):
 #  NODE -- LLM_Multitool
 # =============================================================================
 
-class UnslothProAPI:
+class LLMMultitool:
     """
-    OpenAI-compatible LLM node (llama.cpp, Unsloth, OpenAI) -- Vision / Text.
+    Vision / text LLM node for llama.cpp, Ollama, Unsloth Studio and OpenAI-compatible servers.
 
     Outputs
     -------
@@ -515,144 +741,68 @@ class UnslothProAPI:
     @classmethod
     def INPUT_TYPES(cls):
         local = _local_models_cached()
+        multiline = {"multiline": True, "dynamicPrompts": False}
         return {
             "required": {
-
-                # CONNECTION
-                "api_url": ("STRING", {
-                    "default": "http://127.0.0.1:8080",
-                    "tooltip": HELP["api_url"],
-                }),
-                "api_key": ("STRING", {
-                    "default": "",
-                    "tooltip": HELP["api_key"],
-                }),
-
-                # MODE
-                "mode": (["auto", "vision", "text"], {
-                    "default": "auto",
-                    "tooltip": HELP["mode"],
-                }),
-
-                # PROMPTS
-                "_header_system_prompt": (["SYSTEM PROMPT"], {
-                    "default": "SYSTEM PROMPT",
-                }),
-                "system_prompt": ("STRING", {
-                    "multiline":      True,
-                    "default":        "You are a helpful assistant.",
-                    "tooltip":        HELP["system_prompt"],
-                    "dynamicPrompts": False,
-                }),
-                "_header_user_prompt": (["USER PROMPT"], {
-                    "default": "USER PROMPT",
-                }),
-                "user_prompt": ("STRING", {
-                    "multiline":      True,
-                    "default":        "Describe this image in detail.",
-                    "tooltip":        HELP["user_prompt"],
-                    "dynamicPrompts": False,
-                }),
-
-                # SAMPLING
-                "temperature": ("FLOAT", {
-                    "default": _GEMMA4_TEMP,
-                    "min": 0.0, "max": 2.0, "step": 0.01,
-                    "tooltip": HELP["temperature"],
-                }),
-                "top_p": ("FLOAT", {
-                    "default": _GEMMA4_TOP_P,
-                    "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": HELP["top_p"],
-                }),
-                "top_k": ("INT", {
-                    "default": _GEMMA4_TOP_K,
-                    "min": -1, "max": 200, "step": 1,
-                    "tooltip": HELP["top_k"],
-                }),
-                "min_p": ("FLOAT", {
-                    "default": _GEMMA4_MIN_P,
-                    "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": HELP["min_p"],
-                }),
-                "repetition_penalty": ("FLOAT", {
-                    "default": _GEMMA4_REP_PEN,
-                    "min": 0.0, "max": 2.0, "step": 0.01,
-                    "tooltip": HELP["repetition_penalty"],
-                }),
-                "presence_penalty": ("FLOAT", {
-                    "default": _GEMMA4_PRES_PEN,
-                    "min": -2.0, "max": 2.0, "step": 0.01,
-                    "tooltip": HELP["presence_penalty"],
-                }),
-
-                # OUTPUT CONTROLS
-                "max_tokens": ("INT", {
-                    "default": _GEMMA4_MAX_TOKENS,
-                    "min": 1, "max": 32768, "step": 64,
-                    "tooltip": HELP["max_tokens"],
-                }),
-                "seed": ("INT", {
-                    "default": -1,
-                    "min": -1, "max": 2**32 - 1, "step": 1,
-                    "tooltip": HELP["seed"],
-                }),
-                "timeout_s": ("INT", {
-                    "default": 120,
-                    "min": 30, "max": 600, "step": 10,
-                    "tooltip": HELP["timeout_s"],
-                }),
-                "max_retries": ("INT", {
-                    "default": 2,
-                    "min": 0, "max": 5, "step": 1,
-                    "tooltip": HELP["max_retries"],
-                }),
-
-                # THINKING
-                "enable_thinking": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": HELP["enable_thinking"],
-                }),
-                "reasoning_effort": (["none", "low", "medium", "high"], {
-                    "default": "none",
-                    "tooltip": HELP["reasoning_effort"],
-                }),
-            },
-
-            "optional": {
-                "image": ("IMAGE", {
-                    "tooltip": (
-                        "Input image -- required for vision mode.\n"
-                        "ComfyUI IMAGE tensor shape: [B,H,W,C], C=3, float32 0-1."
-                    ),
-                }),
-                "model_id": ("STRING", {
-                    "default": "auto",
-                    "tooltip": HELP["model_id_optional"],
-                }),
-                # Kept optional and last so saved workflows keep their widget order.
-                "backend": (BACKENDS, {
-                    "default": "llama.cpp",
-                    "tooltip": HELP["backend"],
-                }),
-                "extra_body": ("STRING", {
-                    "multiline":      True,
-                    "default":        "",
-                    "tooltip":        HELP["extra_body"],
-                    "dynamicPrompts": False,
-                }),
-                # New widgets go last, again for saved-workflow widget order.
+                # MODEL / CONNECTION
                 "local_model": ([SERVER_CHOICE] + list(local), {
-                    "default": SERVER_CHOICE,
-                    "tooltip": HELP["local_model"],
-                }),
-                "text": ("STRING", {
-                    "forceInput": True,
-                    "tooltip":    HELP["text"],
-                }),
+                    "default": SERVER_CHOICE, "tooltip": HELP["local_model"]}),
+                "api_url": ("STRING", {
+                    "default": "http://127.0.0.1:8080", "tooltip": HELP["api_url"]}),
+                "backend": (BACKENDS, {
+                    "default": "llama.cpp", "tooltip": HELP["backend"]}),
+                "model_id": ("STRING", {
+                    "default": "auto", "tooltip": HELP["model_id_optional"]}),
+                "api_key_env": ("STRING", {
+                    "default": "", "tooltip": HELP["api_key_env"]}),
+                # PROMPT
+                "mode": (["auto", "vision", "text"], {
+                    "default": "auto", "tooltip": HELP["mode"]}),
+                "system_prompt": ("STRING", {**multiline,
+                    "default": "You are a helpful assistant.", "tooltip": HELP["system_prompt"]}),
+                "user_prompt": ("STRING", {**multiline,
+                    "default": "Describe this image in detail.", "tooltip": HELP["user_prompt"]}),
+                # SAMPLING
+                "temperature": ("FLOAT", {"default": _DEFAULT_TEMP, "min": 0.0, "max": 2.0,
+                                          "step": 0.01, "tooltip": HELP["temperature"]}),
+                "top_p": ("FLOAT", {"default": _DEFAULT_TOP_P, "min": 0.0, "max": 1.0,
+                                    "step": 0.01, "tooltip": HELP["top_p"]}),
+                "top_k": ("INT", {"default": _DEFAULT_TOP_K, "min": -1, "max": 200,
+                                  "tooltip": HELP["top_k"]}),
+                "min_p": ("FLOAT", {"default": _DEFAULT_MIN_P, "min": 0.0, "max": 1.0,
+                                    "step": 0.01, "tooltip": HELP["min_p"]}),
+                "repetition_penalty": ("FLOAT", {"default": _DEFAULT_REP_PEN, "min": 0.0, "max": 2.0,
+                                                 "step": 0.01, "tooltip": HELP["repetition_penalty"]}),
+                "presence_penalty": ("FLOAT", {"default": _DEFAULT_PRES_PEN, "min": -2.0, "max": 2.0,
+                                               "step": 0.01, "tooltip": HELP["presence_penalty"]}),
+                "max_tokens": ("INT", {"default": _DEFAULT_MAX_TOKENS, "min": 1, "max": 32768,
+                                       "step": 64, "tooltip": HELP["max_tokens"]}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2**32 - 1,
+                                 "tooltip": HELP["seed"]}),
+                # THINKING
+                "enable_thinking": ("BOOLEAN", {"default": False, "tooltip": HELP["enable_thinking"]}),
+                "reasoning_effort": (["none", "low", "medium", "high"], {
+                    "default": "none", "tooltip": HELP["reasoning_effort"]}),
+                # OUTPUT / VRAM / SAFETY
+                "clean_output": ("BOOLEAN", {"default": False, "tooltip": HELP["clean_output"]}),
+                "image_mode": (["first", "all"], {"default": "first", "tooltip": HELP["image_mode"]}),
+                "unload_after": ("BOOLEAN", {"default": False, "tooltip": HELP["unload_after"]}),
+                "keep_alive": ("INT", {"default": 0, "min": 0, "max": 86400, "step": 60,
+                                       "tooltip": HELP["keep_alive"]}),
+                "on_error": (["stop", "return text"], {"default": "stop", "tooltip": HELP["on_error"]}),
+                "timeout_s": ("INT", {"default": 120, "min": 30, "max": 600, "step": 10,
+                                      "tooltip": HELP["timeout_s"]}),
+                "max_retries": ("INT", {"default": 2, "min": 0, "max": 5,
+                                        "tooltip": HELP["max_retries"]}),
+                "extra_body": ("STRING", {**multiline, "default": "", "tooltip": HELP["extra_body"]}),
+            },
+            "optional": {
+                "image": ("IMAGE", {"tooltip": HELP["image"]}),
+                "text": ("STRING", {"forceInput": True, "tooltip": HELP["text"]}),
             },
         }
 
+    OUTPUT_NODE     = True
     RETURN_TYPES    = ("STRING", "STRING", "STRING", "STRING")
     RETURN_NAMES    = ("response","thinking","active_model","active_mode")
     OUTPUT_TOOLTIPS = (
@@ -671,37 +821,38 @@ class UnslothProAPI:
         # missing here -- _chat() reports it only if this node actually runs.
         return True
 
-    # -- Image / Tensor helpers ------------------------------------------------
-
-    @staticmethod
-    def _tensor_to_b64_jpeg(image_tensor) -> str:
-        # Only the first image of a batch is sent.
-        arr = np.clip(255.0 * image_tensor[0].cpu().numpy(), 0, 255).astype(np.uint8)
-        img = Image.fromarray(arr).convert("RGB")    # RGBA / grayscale -> JPEG-safe
-        buf = BytesIO()
-        img.save(buf, format="JPEG", quality=92)
-        return base64.b64encode(buf.getvalue()).decode("utf-8")
-
     # -- Main execute ---------------------------------------------------------
 
+    @classmethod
+    def IS_CHANGED(cls, seed=-1, **kwargs):
+        # seed -1 = random -> NaN never equals itself, so ComfyUI never serves a cached reply
+        return float("nan") if seed == -1 else ""
+
     def chat(self, **kwargs):
+        on_error = kwargs.pop("on_error", "stop")
         result = self._chat(**kwargs)
+        if on_error == "stop" and str(result[0]).startswith("ERROR:"):
+            raise RuntimeError(f"LLM_Multitool: {result[0][6:].strip()}")
         # Shown on the node itself (web/llm_multitool.js), no wire needed.
         return {"ui": {"active_model": [result[2]]}, "result": result}
 
     def _chat(
-        self,
-        api_url, api_key, mode,
-        _header_system_prompt, system_prompt, user_prompt, _header_user_prompt,
-        temperature, top_p, top_k, min_p,
-        repetition_penalty, presence_penalty,
-        max_tokens, seed, timeout_s, max_retries,
-        enable_thinking, reasoning_effort,
-        image=None, model_id="auto",
-        backend="llama.cpp", extra_body="",
-        local_model=SERVER_CHOICE, text=None,
+        self, local_model=SERVER_CHOICE, api_url="http://127.0.0.1:8080", backend="llama.cpp",
+        model_id="auto", api_key_env="", mode="auto",
+        system_prompt="", user_prompt="",
+        temperature=_DEFAULT_TEMP, top_p=_DEFAULT_TOP_P, top_k=_DEFAULT_TOP_K,
+        min_p=_DEFAULT_MIN_P, repetition_penalty=_DEFAULT_REP_PEN,
+        presence_penalty=_DEFAULT_PRES_PEN, max_tokens=_DEFAULT_MAX_TOKENS, seed=-1,
+        enable_thinking=False, reasoning_effort="none",
+        clean_output=False, image_mode="first", unload_after=False, keep_alive=0,
+        timeout_s=120, max_retries=2, extra_body="",
+        image=None, text=None,
     ):
-        base_url   = api_url.rstrip("/")
+        api_key, key_err = _resolve_api_key(api_key_env)
+        if key_err:
+            return (f"ERROR: {key_err}", "", "none", mode)
+
+        base_url   = _normalize_url(api_url)
         if mode == "auto":
             mode = "vision" if image is not None else "text"
         is_vision  = mode == "vision"
@@ -718,7 +869,12 @@ class UnslothProAPI:
 
         # 1 -- Resolve model
         model_extra = {}
-        if local_model and local_model != SERVER_CHOICE:
+        is_local = bool(local_model and local_model != SERVER_CHOICE)
+        if is_local:
+            if is_vision and local_model.endswith(" (text)"):
+                return (f"ERROR: '{local_model}' is text only (no mmproj next to it) -- "
+                        "pick a model without '(text)' for images, or set mode to 'text'.",
+                        "", "none", mode)
             base_url, model_id, err = _ensure_local_server(local_model)
             if err:
                 return (f"ERROR: {err}", "", "none", mode)
@@ -739,67 +895,146 @@ class UnslothProAPI:
             )
 
         # 3 -- Build user content
-        img_b64 = None
+        img_b64_list = []
         if is_vision:
-            img_b64 = self._tensor_to_b64_jpeg(image)
-            user_content = [
-                {"type": "text",      "text": user_prompt},
-                {"type": "image_url", "image_url": {
-                    "url": f"data:image/jpeg;base64,{img_b64}",
-                }},
-            ]
+            n_imgs = min(image.shape[0], 8) if image_mode == "all" else 1
+            if image_mode == "all" and image.shape[0] > 8:
+                print(f"[LLM_Multitool] Batch has {image.shape[0]} images, only the first 8 are sent.")
+            for i in range(n_imgs):
+                arr = np.clip(255.0 * image[i].cpu().numpy(), 0, 255).astype(np.uint8)
+                img = Image.fromarray(arr).convert("RGB")
+                buf = BytesIO()
+                img.save(buf, format="JPEG", quality=92)
+                img_b64_list.append(base64.b64encode(buf.getvalue()).decode("utf-8"))
+            img_b64 = img_b64_list[0] if img_b64_list else None
+            if backend == "ollama":
+                # Ollama: images as separate base64 array
+                user_content = user_prompt
+            else:
+                user_content = [{"type": "text", "text": user_prompt}]
+                for b64 in img_b64_list:
+                    user_content.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                    })
         else:
             user_content = user_prompt
+            img_b64 = None
 
         # 4 -- Build payload
-        payload = {
-            "model": model_id,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_content},
-            ],
-            "temperature":        temperature,
-            "top_p":              top_p,
-            "presence_penalty":   presence_penalty,
-            "max_tokens":         max_tokens,
-            "stream":             False,
-        }
+        if backend == "ollama":
+            # Ollama native: POST /api/chat, images as base64 array, keep_alive
+            user_msg = {"role": "user", "content": user_content}
+            if is_vision and img_b64_list:
+                user_msg["images"] = img_b64_list      # /api/chat: images belong to the message
+            payload = {
+                "model": model_id,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    user_msg,
+                ],
+                "stream": False,
+                "options": {
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "top_k": top_k,
+                    "min_p": min_p,
+                    "repeat_penalty": repetition_penalty,
+                    "presence_penalty": presence_penalty,
+                    "num_predict": max_tokens,
+                },
+            }
+            if seed != -1:
+                payload["options"]["seed"] = seed
+            if enable_thinking:
+                payload["think"] = reasoning_effort if reasoning_effort != "none" else True
+            # keep_alive: 0 = unload immediately (frees VRAM)
+            payload["keep_alive"] = keep_alive if not unload_after else 0
+            payload.update(extra)
+        else:
+            payload = {
+                "model": model_id,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": user_content},
+                ],
+                "temperature":        temperature,
+                "top_p":              top_p,
+                "presence_penalty":   presence_penalty,
+                "max_tokens":         max_tokens,
+                "stream":             False,
+            }
 
-        # Backend-specific parameter names
-        if backend in LLAMA_CPP:
-            payload["top_k"]          = top_k
-            payload["min_p"]          = min_p
-            payload["repeat_penalty"] = repetition_penalty
-            # llama.cpp hands this to the chat template (Qwen3 / Gemma thinking switch)
-            payload["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
-        elif backend == "unsloth":
-            payload["top_k"]              = top_k
-            payload["min_p"]              = min_p
-            payload["repetition_penalty"] = repetition_penalty
-            payload["enable_thinking"]    = enable_thinking
-            payload.update(model_extra)
+            # Backend-specific parameter names
+            if backend == "llama.cpp":
+                payload["top_k"]          = top_k
+                payload["min_p"]          = min_p
+                payload["repeat_penalty"] = repetition_penalty
+                # llama.cpp hands this to the chat template (Qwen3 / Gemma thinking switch)
+                payload["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
+            elif backend == "unsloth":
+                payload["top_k"]              = top_k
+                payload["min_p"]              = min_p
+                payload["repetition_penalty"] = repetition_penalty
+                payload["enable_thinking"]    = enable_thinking
+                payload.update(model_extra)
 
-        if enable_thinking and reasoning_effort != "none":
-            payload["reasoning_effort"] = reasoning_effort
-        if seed != -1:               payload["seed"]             = seed
+            if enable_thinking and reasoning_effort != "none":
+                payload["reasoning_effort"] = reasoning_effort
+            if seed != -1:               payload["seed"]             = seed
 
-        # extra_body wins over everything above
-        payload.update(extra)
+            # extra_body wins over everything above
+            payload.update(extra)
 
         # 5 -- Send with exponential back-off retry
         last_err = ""
+        endpoint = "/api/chat" if backend == "ollama" else "/v1/chat/completions"
         for attempt in range(max_retries + 1):
             try:
                 r = requests.post(
-                    f"{base_url}/v1/chat/completions",
+                    f"{base_url}{endpoint}",
                     json=payload,
                     headers=_build_headers(api_key),
                     timeout=timeout_s,
                 )
                 r.raise_for_status()
-                msg      = r.json()["choices"][0]["message"]
-                content  = msg.get("content") or ""
-                thinking = msg.get("reasoning_content") or msg.get("thinking") or ""
+                if backend == "ollama":
+                    data     = r.json()
+                    msg      = data.get("message") or {}
+                    content  = msg.get("content") or ""
+                    thinking = msg.get("thinking") or ""
+                    finish   = data.get("done_reason") or ""
+                else:
+                    choice   = r.json()["choices"][0]
+                    msg      = choice["message"]
+                    content  = msg.get("content") or ""
+                    thinking = msg.get("reasoning_content") or msg.get("thinking") or ""
+                    finish   = choice.get("finish_reason") or ""
+
+                if not content.strip():
+                    why = ("max_tokens was used up" + (" by thinking" if thinking else "")
+                           + " -- raise max_tokens or turn enable_thinking off."
+                           if finish == "length" else "the model returned no text.")
+                    return (f"ERROR: Empty response -- {why}", thinking, model_label, mode)
+
+                # Optional clean-up, e.g. when the reply goes straight into a render prompt
+                if clean_output:
+                    content = _clean_response(content)
+
+                # Unload after run
+                if unload_after and is_local:
+                    _stop_local_server()       # own server: no router API, just stop it
+                elif unload_after and backend == "llama.cpp":
+                    try:
+                        requests.post(
+                            f"{base_url}/models/unload",
+                            json={"model": model_id},
+                            headers=_build_headers(api_key),
+                            timeout=10,
+                        )
+                        print(f"[LLM_Multitool] Unloaded model '{model_id}' (unload_after=True)")
+                    except Exception as ue:
+                        print(f"[LLM_Multitool] Unload failed (non-fatal): {ue}")
 
                 return (content, thinking, model_label, mode)
 
@@ -830,10 +1065,10 @@ class UnslothProAPI:
                     422: f"422 Validation error -- {r.text[:400]}",
                     500: f"500 Server error -- {r.text[:200]}",
                 }
-                return (
-                    f"ERROR: {detail.get(code, f'HTTP {code} -- {r.text[:200]}')}",
-                    "", model_label, mode,
-                )
+                msg = detail.get(code, f'HTTP {code} -- {r.text[:200]}')
+                if is_vision and code in (400, 500):
+                    msg += " (Sending an image? The model may have no vision projector / mmproj.)"
+                return (f"ERROR: {msg}", "", model_label, mode)
 
             except KeyError:
                 return (
@@ -857,9 +1092,9 @@ class UnslothProAPI:
 # =============================================================================
 
 NODE_CLASS_MAPPINGS = {
-    "UnslothProAPI":  UnslothProAPI,
+    "LLM_Multitool": LLMMultitool,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "UnslothProAPI":  "LLM_Multitool",
+    "LLM_Multitool": "LLM_Multitool",
 }

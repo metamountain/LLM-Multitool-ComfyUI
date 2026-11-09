@@ -1,0 +1,356 @@
+{
+ "last_node_id": 6,
+ "last_link_id": 8,
+ "nodes": [
+  {
+   "id": 1,
+   "type": "LoadImage",
+   "pos": [
+    50,
+    200
+   ],
+   "size": [
+    315,
+    314
+   ],
+   "flags": {},
+   "order": 0,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "IMAGE",
+     "type": "IMAGE",
+     "links": [
+      1
+     ],
+     "slot_index": 0
+    },
+    {
+     "name": "MASK",
+     "type": "MASK",
+     "links": null
+    }
+   ],
+   "title": "Load Image (start)",
+   "properties": {
+    "Node name for S&R": "LoadImage"
+   },
+   "widgets_values": [
+    "egg/1.png",
+    "image"
+   ]
+  },
+  {
+   "id": 2,
+   "type": "LoadImage",
+   "pos": [
+    50,
+    550
+   ],
+   "size": [
+    315,
+    314
+   ],
+   "flags": {},
+   "order": 1,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "IMAGE",
+     "type": "IMAGE",
+     "links": [
+      2
+     ],
+     "slot_index": 0
+    },
+    {
+     "name": "MASK",
+     "type": "MASK",
+     "links": null
+    }
+   ],
+   "title": "Load Image (end)",
+   "properties": {
+    "Node name for S&R": "LoadImage"
+   },
+   "widgets_values": [
+    "egg/2.png",
+    "image"
+   ]
+  },
+  {
+   "id": 3,
+   "type": "InfiniteMovieAutoPrompt",
+   "pos": [
+    450,
+    300
+   ],
+   "size": [
+    300,
+    350
+   ],
+   "flags": {},
+   "order": 2,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "image_from",
+     "type": "IMAGE",
+     "link": 1
+    },
+    {
+     "name": "image_to",
+     "type": "IMAGE",
+     "link": 2
+    }
+   ],
+   "outputs": [
+    {
+     "name": "prompt",
+     "type": "STRING",
+     "links": [
+      3
+     ],
+     "slot_index": 0
+    },
+    {
+     "name": "descriptions",
+     "type": "STRING",
+     "links": null
+    },
+    {
+     "name": "meta_prompt",
+     "type": "STRING",
+     "links": null
+    }
+   ],
+   "title": "Auto Prompt",
+   "properties": {
+    "Node name for S&R": "InfiniteMovieAutoPrompt"
+   },
+   "widgets_values": [
+    "",
+    "auto",
+    "auto",
+    true,
+    "",
+    25,
+    "",
+    "http://127.0.0.1:8080",
+    "auto",
+    true,
+    "built-in",
+    "local router/llama.cpp",
+    "openai-compatible",
+    "",
+    0,
+    "http://127.0.0.1:11434"
+   ]
+  },
+  {
+   "id": 4,
+   "type": "LLM_Multitool",
+   "pos": [
+    850,
+    250
+   ],
+   "size": [
+    320,
+    450
+   ],
+   "flags": {},
+   "order": 3,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "text",
+     "type": "STRING",
+     "link": 3
+    }
+   ],
+   "outputs": [
+    {
+     "name": "response",
+     "type": "STRING",
+     "links": [
+      4
+     ],
+     "slot_index": 0
+    },
+    {
+     "name": "thinking",
+     "type": "STRING",
+     "links": null
+    },
+    {
+     "name": "active_model",
+     "type": "STRING",
+     "links": null
+    },
+    {
+     "name": "active_mode",
+     "type": "STRING",
+     "links": null
+    }
+   ],
+   "title": "LLM_Multitool (external LLM)",
+   "properties": {
+    "Node name for S&R": "LLM_Multitool"
+   },
+   "widgets_values": [
+    "server (api_url)",
+    "http://127.0.0.1:8080",
+    "llama.cpp",
+    "auto",
+    "",
+    "text",
+    "You are a helpful assistant.",
+    "{text}",
+    1.0,
+    0.95,
+    64,
+    0.0,
+    1.1,
+    0.0,
+    2048,
+    -1,
+    "fixed",
+    false,
+    "none",
+    false,
+    "first",
+    false,
+    0,
+    "stop",
+    120,
+    2,
+    ""
+   ]
+  },
+  {
+   "id": 5,
+   "type": "InfiniteMovieRender",
+   "pos": [
+    1250,
+    200
+   ],
+   "size": [
+    300,
+    500
+   ],
+   "flags": {},
+   "order": 4,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "prompt0",
+     "type": "STRING",
+     "link": 4
+    }
+   ],
+   "outputs": [
+    {
+     "name": "segment_paths",
+     "type": "STRING",
+     "links": null
+    },
+    {
+     "name": "save_folder",
+     "type": "STRING",
+     "links": null
+    },
+    {
+     "name": "save_name",
+     "type": "STRING",
+     "links": null
+    },
+    {
+     "name": "images",
+     "type": "IMAGE",
+     "links": null
+    },
+    {
+     "name": "film_path",
+     "type": "STRING",
+     "links": null
+    },
+    {
+     "name": "film",
+     "type": "INFINITE_MOVIE",
+     "links": null
+    }
+   ],
+   "title": "Infinite Movie · Render",
+   "properties": {
+    "Node name for S&R": "InfiniteMovieRender"
+   },
+   "widgets_values": [
+    "",
+    "",
+    true,
+    960,
+    720,
+    2.0,
+    42,
+    "film",
+    "http://127.0.0.1:8080",
+    20000,
+    3600,
+    "http://127.0.0.1:11434",
+    "",
+    "one pass",
+    0.0,
+    ""
+   ]
+  }
+ ],
+ "links": [
+  [
+   1,
+   1,
+   0,
+   3,
+   0,
+   "IMAGE"
+  ],
+  [
+   2,
+   2,
+   0,
+   3,
+   1,
+   "IMAGE"
+  ],
+  [
+   3,
+   3,
+   0,
+   4,
+   0,
+   "STRING"
+  ],
+  [
+   4,
+   4,
+   0,
+   5,
+   0,
+   "STRING"
+  ]
+ ],
+ "groups": [],
+ "config": {},
+ "extra": {
+  "ds": {
+   "scale": 0.7,
+   "offset": [
+    0,
+    0
+   ]
+  },
+  "info": "Example: Infinite Movie AutoPrompt -> LLM_Multitool (external LLM) -> Infinite Movie Render.\n\nThe AutoPrompt node generates a meta-prompt (system + user) for the transition.\nThe LLM_Multitool node sends it to an external LLM (e.g. BeeLlama router, Ollama, OpenAI).\nThe response is used as the shot prompt for the render.\n\nSet api_key_env to the NAME of your environment variable (e.g. GEMINI_API_KEY).\nEnable clean_output for direct use as a render prompt."
+ },
+ "version": 0.4
+}
